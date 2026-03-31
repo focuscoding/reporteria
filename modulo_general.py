@@ -473,6 +473,9 @@ def motor_split_laboratorios(df_final, config_costos=None):
         ].copy()
         es_a_costo = config_costos.get(lab, False)
 
+        if df_lab.empty:          # ← AGREGAR ESTO
+            continue     
+
         for col in ['quantity', 'price_unit', 'costo_laboratorio', 'descuento_valor']:
             if col in df_lab.columns:
                 df_lab[col] = df_lab[col].apply(lambda x: x[0] if isinstance(x, (list, tuple)) else x)
@@ -980,6 +983,23 @@ def render_reporte(fecha_inicio, fecha_fin):
         # Descargas
         if st.session_state.archivos_binarios:
             st.write("### 📥 Descargar por Laboratorio")
+
+            # Labs con Excel generado
+            labs_con_excel = set(st.session_state.archivos_binarios.keys())
+
+            # Labs sin Excel (gano_sellout en todas sus filas)
+            labs_sin_excel = [
+                lab for lab in labs_encontrados
+                if lab not in labs_con_excel
+            ]
+
+            if labs_sin_excel:
+                st.warning(
+                    f"⚠️ Los siguientes laboratorios no tienen líneas para exportar "
+                    f"(SellOut superó CT en todas sus líneas): "
+                    f"**{', '.join(labs_sin_excel)}**"
+                )
+
             items = list(st.session_state.archivos_binarios.items())
             for i in range(0, len(items), 3):
                 cols = st.columns(3)
@@ -990,11 +1010,11 @@ def render_reporte(fecha_inicio, fecha_fin):
                         etiqueta = " (Costo)" if es_costo else ""
                         safe_lab = (
                             lab.replace(" ","_").replace("/","").replace("\\","").replace(":","")
-                               .replace("á","a").replace("é","e").replace("í","i")
-                               .replace("ó","o").replace("ú","u").replace("Á","A")
-                               .replace("É","E").replace("Í","I").replace("Ó","O")
-                               .replace("Ú","U").replace("ü","u").replace("Ü","U")
-                               .replace("ñ","n").replace("Ñ","N")
+                            .replace("á","a").replace("é","e").replace("í","i")
+                            .replace("ó","o").replace("ú","u").replace("Á","A")
+                            .replace("É","E").replace("Í","I").replace("Ó","O")
+                            .replace("Ú","U").replace("ü","u").replace("Ü","U")
+                            .replace("ñ","n").replace("Ñ","N")
                         )
                         with cols[j]:
                             st.download_button(
@@ -1008,7 +1028,6 @@ def render_reporte(fecha_inicio, fecha_fin):
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                 key=f"dl_{lab}_{tipo_activo}_{i+j}".replace(" ","_")
                             )
-
         # Correos
         if tipo_activo in ('SELL-OUT', 'Descuentos CT Lineal', 'Farmago', 'Farmatención'):
             st.divider()
@@ -1018,7 +1037,7 @@ def render_reporte(fecha_inicio, fecha_fin):
                                        value=", ".join(CC_DEFAULT), key="cc_emails_input")
             CC_EMAILS = [e.strip() for e in cc_input.split(",") if e.strip()]
             comment_por_lab = st.session_state.get('comment_por_lab', {})
-
+            labs_con_excel = set(st.session_state.archivos_binarios.keys())
             for i in range(0, len(labs_encontrados), 3):
                 cols = st.columns(3)
                 for j in range(3):
@@ -1028,6 +1047,18 @@ def render_reporte(fecha_inicio, fecha_fin):
                             lab, fecha_inicio, fecha_fin, comment_por_lab, CC_EMAILS
                         )
                         tiene_correos = len(correos_to) > 0
-                        etiqueta = f"✉️ {lab}" if tiene_correos else f"⚠️ {lab} (sin correos)"
+                        sin_excel     = lab not in labs_con_excel   # ← AGREGAR
+
+                        if sin_excel:
+                            etiqueta = f"🚫 {lab} (sin líneas CT)"  # ← AGREGAR
+                        elif tiene_correos:
+                            etiqueta = f"✉️ {lab}"
+                        else:
+                            etiqueta = f"⚠️ {lab} (sin correos)"
+
                         with cols[j]:
-                            st.link_button(etiqueta, mailto, disabled=not tiene_correos)
+                            st.link_button(
+                                etiqueta,
+                                mailto,
+                                disabled=not tiene_correos or sin_excel   # ← MODIFICAR
+                            )
