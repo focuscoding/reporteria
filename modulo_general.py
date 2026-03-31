@@ -467,7 +467,10 @@ def motor_split_laboratorios(df_final, config_costos=None):
     tipo_activo = st.session_state.get('tipo_reporte_activo', '')
 
     for lab in df_final['laboratory_name'].unique():
-        df_lab = df_final[df_final['laboratory_name'] == lab].copy()
+        df_lab = df_final[
+        (df_final['laboratory_name'] == lab) &
+        (df_final['gano_sellout'] == False)
+        ].copy()
         es_a_costo = config_costos.get(lab, False)
 
         for col in ['quantity', 'price_unit', 'costo_laboratorio', 'descuento_valor']:
