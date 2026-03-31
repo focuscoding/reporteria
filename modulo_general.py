@@ -312,7 +312,7 @@ def aplicar_descuentos_ct(df_final, url_ct, cadena_filtro=None):
 
     # Deduplicar: por línea de factura, Detalle (último en concat si ordenamos) gana
     # Ordenar: detalle al final para que keep='last' lo preserve
-    df_union = df_union.sort_values('_fuente', ascending=True)  # hoja1 < detalle alfabéticamente
+    df_union = df_union.sort_values('_fuente', ascending=True)
     id_dedup = [c for c in ['id', 'move_id_int', 'product_id_int'] if c in df_union.columns]
     if id_dedup:
         df_union = df_union.drop_duplicates(subset=id_dedup, keep='last')
@@ -321,21 +321,35 @@ def aplicar_descuentos_ct(df_final, url_ct, cadena_filtro=None):
     n_detalle = (df_union['_fuente'] == 'detalle').sum()
     st.toast(f"CT: {n_hoja1} desde Hoja1 · {n_detalle} desde Detalle")
 
-    df_union = df_union.drop(columns=['_fuente'], errors='ignore')
+    # Renombrar para que Parte D pueda distinguir fuente tras el drop
+    df_union = df_union.rename(columns={'_fuente': '_fuente_final'})
+    # NO se dropea aquí — se dropea al final junto con las demás columnas auxiliares
 
-    # ── PARTE D: aplicar lista Excluir ──────────────────────────────
+    # ── PARTE D: aplicar lista Excluir (solo sobre filas de Hoja1) ──
     if not df_excluir.empty and 'barcode_norm' in df_union.columns and 'lab_key' in df_union.columns:
-        excl_check = df_union[['barcode_norm', 'lab_key']].merge(
-            df_excluir,
-            left_on=['barcode_norm', 'lab_key'],
-            right_on=['barcode_excluido', 'laboratorio_excluir_key'],
-            how='left', indicator=True
-        )
-        mask_excluir = (excl_check['_merge'] == 'both').values
-        n_excl = mask_excluir.sum()
-        if n_excl > 0:
-            st.caption(f"ℹ️ {n_excl} línea(s) excluidas por lista sin descuento CT.")
-        df_union = df_union[~mask_excluir].copy()
+        # Separar por fuente antes de aplicar exclusión
+        mask_hoja1   = df_union['_fuente_final'] == 'hoja1'
+        df_solo_h1   = df_union[mask_hoja1].copy()
+        df_solo_det  = df_union[~mask_hoja1].copy()
+
+        if not df_solo_h1.empty:
+            excl_check = df_solo_h1[['barcode_norm', 'lab_key']].merge(
+                df_excluir,
+                left_on=['barcode_norm', 'lab_key'],
+                right_on=['barcode_excluido', 'laboratorio_excluir_key'],
+                how='left', indicator=True
+            )
+            mask_excluir = (excl_check['_merge'] == 'both').values
+            n_excl = mask_excluir.sum()
+            if n_excl > 0:
+                st.caption(
+                    f"ℹ️ {n_excl} línea(s) excluidas de Hoja1 por lista CT "
+                    f"(Detalle mantiene su override)."
+                )
+            df_solo_h1 = df_solo_h1[~mask_excluir].copy()
+
+        # Reunificar: Detalle intacto + Hoja1 filtrada
+        df_union = pd.concat([df_solo_h1, df_solo_det], ignore_index=True)
 
     # ── Debug info ───────────────────────────────────────────────────
     debug_odoo_keys = (
@@ -371,7 +385,7 @@ def aplicar_descuentos_ct(df_final, url_ct, cadena_filtro=None):
         columns=['partner_key', 'lab_key', 'cadena_key_f', 'barcode_norm',
                  'partner_name_key', 'laboratorio_key',
                  'barcode_det', 'laboratorio_det_key', 'cadena_cliente_det_key',
-                 'cadena_key'],
+                 'cadena_key', 'fuente_final'],
         errors='ignore'
     )
     return df_union, debug_info
