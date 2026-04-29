@@ -1,7 +1,9 @@
 import streamlit as st
 from datetime import date, timedelta
 import modulo_farmago
-import modulo_general
+import modulo_general_excluyente
+import modulo_general_libre
+import modulo_extraccion_general
 
 
 
@@ -55,12 +57,16 @@ if parametros_actuales != st.session_state.parametros_previos:
     st.session_state.parametros_previos = parametros_actuales
 
 # --- NAVEGACIÓN ---
-opcion = st.sidebar.radio("Seleccione Reporte", ["Facturación Farmago", "Reportes Sell-Out"])
+opcion = st.sidebar.radio("Seleccione Reporte", ["Facturación Farmago", "Reportes Sell-Out Excluyente", "Reportes Sell-Out Libre", "Extracción General"])
 
 st.divider()
 
 if opcion == "Facturación Farmago":
     # Pasamos las fechas como argumentos a la función del módulo
     modulo_farmago.render_reporte(f_inicio, f_fin)
+elif opcion == "Reportes Sell-Out Excluyente":
+    modulo_general_excluyente.render_reporte(f_inicio, f_fin)
+elif opcion == "Reportes Sell-Out Libre":
+    modulo_general_libre.render_reporte(f_inicio, f_fin)
 else:
-    modulo_general.render_reporte(f_inicio, f_fin)
+    modulo_extraccion_general.render_extraccion_general(f_inicio, f_fin)
