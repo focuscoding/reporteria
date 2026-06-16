@@ -91,6 +91,8 @@ def obtener_ct_hoja1(url_base):
             df.columns[1]: 'cadena',
             df.columns[2]: 'laboratorio',
             df.columns[3]: 'descuento_valor_raw',
+            df.columns[6]: 'vigencia_inicio',   
+            df.columns[7]: 'vigencia_fin',      
         })
 
         desc_limpio   = df['descuento_valor_raw'].astype(str).str.replace('%','',regex=False).str.strip()
@@ -104,9 +106,13 @@ def obtener_ct_hoja1(url_base):
         df['partner_name_key'] = df['partner_name'].astype(str).str.strip().str.lower()
         df['laboratorio_key']  = df['laboratorio'].astype(str).str.strip().str.lower()
         df['cadena_key']       = df['cadena'].astype(str).str.strip().str.lower().apply(quitar_tildes)
+        df['vigencia_inicio'] = pd.to_datetime(df['vigencia_inicio'], errors='coerce').dt.date
+        df['vigencia_fin']    = pd.to_datetime(df['vigencia_fin'],    errors='coerce').dt.date
 
         return df[['partner_name', 'partner_name_key', 'cadena', 'cadena_key',
-                   'laboratorio', 'laboratorio_key', 'descuento_ct']]
+                'laboratorio', 'laboratorio_key', 'descuento_ct',
+                'vigencia_inicio', 'vigencia_fin']]  
+        
     except Exception as e:
         st.error(f"Error leyendo Hoja1 CT: {e}")
         return pd.DataFrame()
@@ -228,22 +234,44 @@ def aplicar_descuentos_ct(df_final, url_ct, cadena_filtro=None):
             df_h1_filt = df_hoja1[~df_hoja1['cadena_key'].isin(CADENAS_FARMAGO_FARMATENCION)].copy()
 
         if not df_h1_filt.empty:
+            # rama cadena (Farmago / Farmatención)
             if cadena_norm:
                 df_h1_merge = df_h1_filt.drop_duplicates(subset=['cadena_key', 'laboratorio_key'])
                 df_hoja1_result = df_final.merge(
-                    df_h1_merge[['cadena_key', 'laboratorio_key', 'descuento_ct']],
+                    df_h1_merge[['cadena_key', 'laboratorio_key', 'descuento_ct',
+                                'vigencia_inicio', 'vigencia_fin']],   # ← agregar fechas
                     left_on=['cadena_key_f', 'lab_key'],
                     right_on=['cadena_key', 'laboratorio_key'],
                     how='inner'
                 )
+            # rama general (CT Lineal)
             else:
                 df_hoja1_result = df_final.merge(
-                    df_h1_filt[['partner_name_key', 'laboratorio_key', 'descuento_ct']],
+                    df_h1_filt[['partner_name_key', 'laboratorio_key', 'descuento_ct',
+                                'vigencia_inicio', 'vigencia_fin']],   # ← agregar fechas
                     left_on=['partner_key', 'lab_key'],
                     right_on=['partner_name_key', 'laboratorio_key'],
                     how='inner'
                 )
             df_hoja1_result = df_hoja1_result.rename(columns={'descuento_ct': 'descuento_valor'})
+
+            if 'vigencia_inicio' in df_hoja1_result.columns and 'vigencia_fin' in df_hoja1_result.columns:
+                df_hoja1_result['invoice_date_obj'] = pd.to_datetime(
+                    df_hoja1_result['invoice_date'], errors='coerce'
+                ).dt.date
+                dentro_rango = (
+                    df_hoja1_result['vigencia_inicio'].notna() &
+                    df_hoja1_result['vigencia_fin'].notna() &
+                    (df_hoja1_result['invoice_date_obj'] >= df_hoja1_result['vigencia_inicio']) &
+                    (df_hoja1_result['invoice_date_obj'] <= df_hoja1_result['vigencia_fin'])
+                )
+                n_fuera = (~dentro_rango).sum()
+                if n_fuera > 0:
+                    st.caption(f"ℹ️ CT Hoja1: {n_fuera} línea(s) fuera de vigencia o sin fechas definidas excluidas.")
+                df_hoja1_result = df_hoja1_result[dentro_rango].copy()
+                df_hoja1_result = df_hoja1_result.drop(columns=['invoice_date_obj'], errors='ignore')
+
+
             df_hoja1_result['_fuente'] = 'hoja1'
     else:
         df_h1_filt = pd.DataFrame()
@@ -385,7 +413,7 @@ def aplicar_descuentos_ct(df_final, url_ct, cadena_filtro=None):
         columns=['partner_key', 'lab_key', 'cadena_key_f', 'barcode_norm',
                  'partner_name_key', 'laboratorio_key',
                  'barcode_det', 'laboratorio_det_key', 'cadena_cliente_det_key',
-                 'cadena_key', 'fuente_final'],
+                 'cadena_key', 'fuente_final', 'vigencia_inicio', 'vigencia_fin'],
         errors='ignore'
     )
     return df_union, debug_info
