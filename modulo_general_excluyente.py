@@ -143,7 +143,13 @@ def obtener_ct_detalle(url_base):
         df['laboratorio_det_key']    = df['laboratorio_det'].astype(str).str.strip().str.lower()
         df['cadena_cliente_det_key'] = df['cadena_cliente_det'].astype(str).str.strip().str.lower().apply(quitar_tildes)
 
-        return df[['barcode_det', 'laboratorio_det_key', 'cadena_cliente_det_key', 'descuento_det']]
+        df['det_inicio'] = pd.to_datetime(df.iloc[:, 5], errors='coerce').dt.date
+        df['det_fin']    = pd.to_datetime(df.iloc[:, 6], errors='coerce').dt.date
+
+        return df[['barcode_det', 'laboratorio_det_key', 'cadena_cliente_det_key', 'descuento_det',
+                   'det_inicio', 'det_fin']]
+
+
     except Exception as e:
         st.warning(f"⚠️ No se pudo leer pestaña Detalle CT: {e}")
         return pd.DataFrame()
@@ -302,20 +308,59 @@ def aplicar_descuentos_ct(df_final, url_ct, cadena_filtro=None):
             #             st.write("🔍 DEBUG Detalle — claves barcode_det × laboratorio_det_key × cadena_cliente_det_key:")
             #             st.dataframe(df_det_filt[['barcode_det','laboratorio_det_key','cadena_cliente_det_key','descuento_det']].head(20))
             #             # Match por cadena O por cliente — tomamos el que matchee
+            
+            
+            
+            
+            
+            
             merge_cad = df_final.merge(
-                df_det_filt[['barcode_det', 'laboratorio_det_key', 'cadena_cliente_det_key', 'descuento_det']],
+                df_det_filt[['barcode_det', 'laboratorio_det_key', 'cadena_cliente_det_key', 'descuento_det','det_inicio', 'det_fin']],
                 left_on=['barcode_norm', 'lab_key', 'cadena_key_f'],
                 right_on=['barcode_det', 'laboratorio_det_key', 'cadena_cliente_det_key'],
                 how='inner'
             )
             merge_cli = df_final.merge(
-                df_det_filt[['barcode_det', 'laboratorio_det_key', 'cadena_cliente_det_key', 'descuento_det']],
+                df_det_filt[['barcode_det', 'laboratorio_det_key', 'cadena_cliente_det_key', 'descuento_det','det_inicio', 'det_fin']],
                 left_on=['barcode_norm', 'lab_key', 'partner_key'],
                 right_on=['barcode_det', 'laboratorio_det_key', 'cadena_cliente_det_key'],
                 how='inner'
             )
+
+            
+            
+            # Filtrar por fechas de vigencia de Detalle usando invoice_date
+            for _df in [merge_cad, merge_cli]:
+                if 'det_inicio' in _df.columns:
+                    _df['_invoice_date_obj'] = pd.to_datetime(
+                        _df['invoice_date'], errors='coerce'
+                    ).dt.date
+
+            def filtrar_vigencia_det(df_m):
+                if 'det_inicio' not in df_m.columns or df_m.empty:
+                    return df_m.iloc[0:0]  # devuelve vacío si no hay fechas
+                df_m = df_m.copy()
+                # Forzar None → NaT para que notna() funcione correctamente
+                df_m['det_inicio'] = pd.to_datetime(df_m['det_inicio'], errors='coerce')
+                df_m['det_fin']    = pd.to_datetime(df_m['det_fin'],    errors='coerce')
+                df_m['_invoice_date_obj'] = pd.to_datetime(
+                    df_m['invoice_date'], errors='coerce'
+                ).dt.date
+                mask = (
+                    df_m['det_inicio'].notna() &
+                    df_m['det_fin'].notna() &
+                    (df_m['_invoice_date_obj'] >= df_m['det_inicio'].dt.date) &
+                    (df_m['_invoice_date_obj'] <= df_m['det_fin'].dt.date)
+                )
+                return df_m[mask].drop(columns=['_invoice_date_obj'], errors='ignore')
+
+            merge_cad = filtrar_vigencia_det(merge_cad)
+            merge_cli = filtrar_vigencia_det(merge_cli)
+
             # Unir ambos matches y deduplicar (cadena tiene prioridad)
             df_detalle_result = pd.concat([merge_cad, merge_cli], ignore_index=True)
+
+
             # Deduplicar por línea de factura: si aparece por cadena Y por cliente, cadena gana
             id_cols = ['id', 'move_id_int', 'product_id_int', 'barcode_norm', 'lab_key']
             id_cols_present = [c for c in id_cols if c in df_detalle_result.columns]
@@ -412,7 +457,8 @@ def aplicar_descuentos_ct(df_final, url_ct, cadena_filtro=None):
         columns=['partner_key', 'lab_key', 'cadena_key_f', 'barcode_norm',
                  'partner_name_key', 'laboratorio_key',
                  'barcode_det', 'laboratorio_det_key', 'cadena_cliente_det_key',
-                 'cadena_key', 'fuente_final','vigencia_inicio', 'vigencia_fin'],
+                 'cadena_key', 'fuente_final','vigencia_inicio', 'vigencia_fin', 
+                 'det_inicio', 'det_fin'],
         errors='ignore'
     )
     return df_union, debug_info
