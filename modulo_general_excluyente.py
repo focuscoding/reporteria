@@ -1,3 +1,4 @@
+#modulo excluyente
 import streamlit as st
 import pandas as pd
 import io
@@ -43,6 +44,105 @@ def url_con_gid(url_base, gid):
     base = url_base.split('?')[0]
     return f"{base}?format=csv&gid={gid}"
 
+def filtrar_por_aplica_cliente(df_final):
+    """
+    Filtra líneas de SELL-OUT según la columna 'aplica_cliente' del Sheets:
+      - contiene 'independiente' → excluye clientes cuya cadena sea 'farmago'
+      - contiene 'farmago'       → incluye solo clientes cuya cadena sea 'farmago'
+      - cualquier otro valor ('todos', vacío, etc.) → sin filtro, aplica a toda la venta
+
+    Usa coincidencia parcial (contains) en vez de igualdad exacta, para tolerar
+    variaciones de texto en el Sheets (espacios, mayúsculas, texto adicional).
+    Como red de seguridad, deduplica por línea de factura dando prioridad a la
+    regla más específica (independientes/farmago) sobre 'todos', evitando así
+    ventas duplicadas si dos filas del Sheets matchean el mismo barcode.
+    """
+    if 'aplica_cliente' not in df_final.columns:
+        return df_final
+
+    df_final = df_final.copy()
+
+    cadena_norm = df_final['cadena_val'].apply(
+        lambda x: quitar_tildes((x[1] if isinstance(x, (list, tuple)) else str(x)).strip().lower())
+        if x else ''
+    )
+    aplica_norm = df_final['aplica_cliente'].astype(str)  # ya viene normalizado (sin tildes, lower)
+
+    es_independientes = aplica_norm.str.contains('independiente', na=False)
+    es_farmago         = aplica_norm.str.contains('farmago', na=False)
+    es_todos            = ~(es_independientes | es_farmago)
+
+    # ── Diagnóstico: valores que no matchean ninguna categoría conocida ──
+    valores_no_reconocidos = sorted(set(aplica_norm[es_todos]) - {'', 'nan', 'todos'})
+    if valores_no_reconocidos:
+        st.warning(
+            f"⚠️ 'aplica_cliente' con valores no reconocidos (tratados como 'Todos'): "
+            f"{', '.join(valores_no_reconocidos)}"
+        )
+
+    mask = (
+        (es_independientes & (cadena_norm != 'farmago')) |
+        (es_farmago & (cadena_norm == 'farmago')) |
+        es_todos
+    )
+
+    n_excl = (~mask).sum()
+    if n_excl > 0:
+        st.caption(f"ℹ️ SELL-OUT: {n_excl} línea(s) excluidas por regla 'aplica_cliente'.")
+
+    df_final = df_final[mask].copy()
+
+    # ── Red de seguridad: dedupe por línea de factura ─────────────────
+    # Si tras el filtro aún quedan 2+ filas para la misma línea (p.ej. porque
+    # el texto no matcheó ninguna categoría y ambas cayeron en 'todos'),
+    # priorizamos la fila más específica: farmago/independientes > todos.
+    id_cols = [c for c in ['id', 'move_id_int', 'product_id_int'] if c in df_final.columns]
+    if id_cols:
+        df_final['_prioridad'] = np.select(
+            [es_farmago[mask], es_independientes[mask]],
+            [2, 2],
+            default=1
+        )
+        n_antes = len(df_final)
+        df_final = (
+            df_final.sort_values('_prioridad', ascending=False)
+            .drop_duplicates(subset=id_cols, keep='first')
+            .drop(columns=['_prioridad'])
+        )
+        n_dedup = n_antes - len(df_final)
+        if n_dedup > 0:
+            st.warning(
+                f"⚠️ {n_dedup} línea(s) duplicada(s) por múltiples matches en 'aplica_cliente' "
+                f"fueron deduplicadas automáticamente. Revisa el Sheets: probablemente hay texto "
+                f"inconsistente en esa columna."
+            )
+
+    return df_final
+
+def filtrar_sellout_para_reporte_ct(df_so, cadena_reporte):
+    """
+    Selecciona, del SellOut, solo las filas relevantes para el tipo de reporte CT actual.
+    Ya NO deduplica por barcode aquí: se conservan todas las ofertas -incluso varias
+    para el mismo barcode con vigencias distintas- porque la vigencia correcta depende
+    de la fecha de cada factura individual. El dedupe final ocurre en
+    aplicar_comparacion_ct_vs_sellout, después de cruzar con la fecha de cada línea.
+    """
+    if df_so.empty or 'aplica_cliente' not in df_so.columns:
+        return df_so
+
+    aplica_norm = df_so['aplica_cliente'].astype(str)
+    es_farmago         = aplica_norm.str.contains('farmago', na=False)
+    es_independientes  = aplica_norm.str.contains('independiente', na=False)
+    es_todos           = ~(es_farmago | es_independientes)
+
+    cadena_norm = quitar_tildes(cadena_reporte.lower().strip()) if cadena_reporte else None
+
+    if cadena_norm == 'farmago':
+        mask = es_farmago | es_todos
+    else:
+        mask = es_independientes | es_todos
+
+    return df_so[mask].copy()
 
 # ─────────────────────────────────────────────
 # LECTURA DE SHEETS
@@ -57,6 +157,7 @@ def obtener_ofertas_sheets(url):
         df = pd.read_csv(url)
         df = df.rename(columns={
             df.columns[0]: 'barcode_key',
+            df.columns[3]: 'aplica_cliente',
             df.columns[4]: 'descuento_valor',
             df.columns[5]: 'nc_check',
             df.columns[7]: 'oferta_inicio',
@@ -65,6 +166,15 @@ def obtener_ofertas_sheets(url):
         df['nc_check']    = df['nc_check'].astype(str).str.upper().str.strip()
         df                = df[df['nc_check'] == 'NC'].copy()
         df['barcode_key'] = estandarizar_barcodes(df['barcode_key'])
+
+        # ── NUEVO: normalizar 'aplica_cliente' (sin tildes, lowercase) ──
+        # Sin esto, .str.contains('independiente'/'farmago') no matchea texto
+        # con mayúsculas o tildes, y TODAS las filas caen en la rama 'Todos',
+        # mezclando descuentos entre Independientes/Farmago/Todos.
+        df['aplica_cliente'] = (
+            df['aplica_cliente'].astype(str).str.strip().str.lower().apply(quitar_tildes)
+        )
+
         df['oferta_inicio'] = pd.to_datetime(df['oferta_inicio'], errors='coerce').dt.date
         df['oferta_fin']    = pd.to_datetime(df['oferta_fin'],    errors='coerce').dt.date
         df['descuento_so']  = (
@@ -500,44 +610,91 @@ def aplicar_comparacion_sellout_vs_ct(df_final, df_ct_ref):
     return df_final
 
 
-def aplicar_comparacion_ct_vs_sellout(df_final, df_so_ref, fecha_inicio, fecha_fin):
+def aplicar_comparacion_ct_vs_sellout(df_final, df_so_ref, fecha_inicio, fecha_fin, cadena_filtro=None):
     """
     CT Fijo / Farmago / Farmatención:
     Si SellOut > CT para ese barcode → descuento_valor = 0, gano_sellout = True.
-    Esas líneas van en Excel pero NO se envían a Sheets.
+    Esas líneas van en Excel pero NO se envían a Sheets. (comportamiento de exclusión SIN CAMBIOS)
+
+    CORRECCIÓN: la vigencia de la oferta SellOut ahora se valida contra la FECHA DE CADA
+    FACTURA individual (invoice_date), no contra el rango completo del reporte. Esto evita
+    que, cuando un barcode tiene varias ofertas SellOut en periodos distintos, se tome
+    una oferta que no aplica realmente a esa factura — lo cual hacía que 'gano_sellout'
+    y el precio base se calcularan mal.
+
+    Además, 'price_unit_base' siempre se calcula (= price_unit / (1 - descuento_so)) cuando
+    hay una oferta SellOut vigente para esa línea, gane o no frente a CT, para que el precio
+    "viaje" correctamente incluso en las líneas que sí sobreviven.
     """
-    df_final['gano_sellout'] = False
+    df_final = df_final.copy()
+    df_final['gano_sellout']    = False
+    df_final['price_unit_base'] = df_final['price_unit'].copy()
+
     if df_so_ref.empty:
         return df_final
 
-    vigentes = df_so_ref[
-        (df_so_ref['oferta_inicio'] <= fecha_fin) &
-        (df_so_ref['oferta_fin']    >= fecha_inicio)
-    ][['barcode_key', 'descuento_so']].copy()
-
-    if vigentes.empty:
+    df_so_ref = filtrar_sellout_para_reporte_ct(df_so_ref, cadena_filtro)
+    if df_so_ref.empty:
         return df_final
 
-    df_final['barcode_tmp'] = estandarizar_barcodes(
+    so_cols = [c for c in ['barcode_key', 'descuento_so', 'oferta_inicio', 'oferta_fin'] if c in df_so_ref.columns]
+    df_so_ref = df_so_ref[so_cols].copy()
+
+    df_final['barcode_tmp']          = estandarizar_barcodes(
         df_final['barcode'].apply(lambda x: x if isinstance(x, str) else str(x))
     )
-    df_final = df_final.merge(
-        vigentes.rename(columns={'descuento_so': 'descuento_so_tmp'}),
+    df_final['invoice_date_obj_tmp'] = pd.to_datetime(df_final['invoice_date'], errors='coerce').dt.date
+    df_final['_row_id_tmp']          = range(len(df_final))
+
+    df_merge = df_final.merge(
+        df_so_ref.rename(columns={'descuento_so': 'descuento_so_tmp'}),
         left_on='barcode_tmp', right_on='barcode_key',
         how='left'
     )
 
-    tiene_so = df_final['descuento_so_tmp'].notna()
-    so_gana  = df_final['descuento_so_tmp'] > df_final['descuento_valor']
-    df_final['gano_sellout'] = tiene_so & so_gana
-    df_final.loc[df_final['gano_sellout'], 'descuento_valor'] = 0
+    # ── Vigencia POR LÍNEA: la fecha de la factura debe caer dentro de la oferta ──
+    df_merge['_dentro_vigencia_tmp'] = (
+        df_merge['oferta_inicio'].notna() &
+        df_merge['oferta_fin'].notna() &
+        (df_merge['invoice_date_obj_tmp'] >= df_merge['oferta_inicio']) &
+        (df_merge['invoice_date_obj_tmp'] <= df_merge['oferta_fin'])
+    )
 
-    n_cero = df_final['gano_sellout'].sum()
+    # Si un barcode tiene varias ofertas, priorizar -por cada línea original- la vigente
+    # con mayor descuento (red de seguridad ante duplicados del merge)
+    df_merge = df_merge.sort_values(
+        ['_row_id_tmp', '_dentro_vigencia_tmp', 'descuento_so_tmp'],
+        ascending=[True, False, False]
+    ).drop_duplicates(subset=['_row_id_tmp'], keep='first')
+
+    tiene_so = df_merge['descuento_so_tmp'].notna() & df_merge['_dentro_vigencia_tmp']
+    so_gana  = tiene_so & (df_merge['descuento_so_tmp'] > df_merge['descuento_valor'])
+
+    # ── Exclusión: comportamiento ORIGINAL sin cambios ──────────────
+    df_merge['gano_sellout'] = so_gana
+    df_merge.loc[df_merge['gano_sellout'], 'descuento_valor'] = 0
+
+    n_cero = df_merge['gano_sellout'].sum()
     if n_cero > 0:
         st.caption(f"ℹ️ {n_cero} línea(s) con descuento 0 — SellOut tiene mayor porcentaje.")
 
-    df_final = df_final.drop(columns=['barcode_tmp', 'barcode_key', 'descuento_so_tmp'], errors='ignore')
-    return df_final
+    # ── price_unit_base viaja siempre que haya SellOut vigente para esa línea ──
+    df_merge.loc[tiene_so, 'price_unit_base'] = (
+        df_merge.loc[tiene_so, 'price_unit'] /
+        (1 - df_merge.loc[tiene_so, 'descuento_so_tmp'].clip(upper=0.9999))
+    )
+
+    n_recalc = tiene_so.sum()
+    if n_recalc > 0:
+        st.caption(f"ℹ️ {n_recalc} línea(s) con precio base recalculado desde SellOut (viaja el precio inverso).")
+
+    return (
+        df_merge.sort_values('_row_id_tmp')
+        .drop(columns=['barcode_tmp', 'barcode_key', 'descuento_so_tmp',
+                        'invoice_date_obj_tmp', 'oferta_inicio', 'oferta_fin',
+                        '_row_id_tmp', '_dentro_vigencia_tmp'], errors='ignore')
+        .reset_index(drop=True)
+    )
 
 
 # ─────────────────────────────────────────────
@@ -572,14 +729,15 @@ def motor_split_laboratorios(df_final, config_costos=None):
             df_lab['valor_calculado'] = df_lab['costo_laboratorio']
         elif tipo_activo == 'SELL-OUT':
             def calcular_precio_fila(row):
-                
                 d = row['descuento_valor']
                 if d >= 1 or d < 0:
                     return row['price_unit']
                 return row['price_unit'] / (1 - d)
             df_lab['valor_calculado'] = df_lab.apply(calcular_precio_fila, axis=1)
         else:
-            df_lab['valor_calculado'] = df_lab['price_unit']
+            # Para CT: usar el precio base (invertido desde SellOut si había oferta vigente)
+            base = df_lab['price_unit_base'] if 'price_unit_base' in df_lab.columns else df_lab['price_unit']
+            df_lab['valor_calculado'] = pd.to_numeric(base, errors='coerce').fillna(df_lab['price_unit'])
 
         reporte = pd.DataFrame({
             'invoice_date':        df_lab['invoice_date'],
@@ -676,7 +834,7 @@ def enviar_a_sheets(df_display, fecha_inicio, fecha_fin, apps_script_url, config
     if tipo_activo in ('Descuentos CT Lineal', 'Farmago', 'Farmatención') and 'gano_sellout' in df.columns:
         df = df[~df['gano_sellout']].copy()
 
-    for col in ['quantity', 'price_unit', 'costo_laboratorio', 'descuento_valor']:
+    for col in ['quantity', 'price_unit', 'costo_laboratorio', 'descuento_valor', 'price_unit_base']:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
@@ -689,14 +847,14 @@ def enviar_a_sheets(df_display, fecha_inicio, fecha_fin, apps_script_url, config
             df_lab['valor_calculado'] = df_lab['costo_laboratorio']
         elif tipo_activo == 'SELL-OUT':
             def calcular_precio_fila(row):
-                
                 d = row['descuento_valor']
                 if d >= 1 or d < 0:
                     return row['price_unit']
                 return row['price_unit'] / (1 - d)
             df_lab['valor_calculado'] = df_lab.apply(calcular_precio_fila, axis=1)
         else:
-            df_lab['valor_calculado'] = df_lab['price_unit']
+            base = df_lab['price_unit_base'] if 'price_unit_base' in df_lab.columns else df_lab['price_unit']
+            df_lab['valor_calculado'] = pd.to_numeric(base, errors='coerce').fillna(df_lab['price_unit'])
 
         df_lab['subtotal_bruto']  = df_lab['quantity'] * df_lab['valor_calculado']
         df_lab['total_descuento'] = df_lab['subtotal_bruto'] * df_lab['descuento_valor']
@@ -871,21 +1029,29 @@ def render_reporte(fecha_inicio, fecha_fin):
                 )).rename(columns={'id': 'move_id_int'})
 
                 df_prods = pd.DataFrame(client.search_read(
-                    'product.product', [('id', 'in', product_ids)],
-                    ['laboratory_name', 'supplier_code', 'barcode']
+                    'product.product',
+                    [('id', 'in', product_ids), ('active', 'in', [True, False])],
+                    ['laboratory_name', 'supplier_code', 'barcode','product_tmpl_id']
                 )).rename(columns={'id': 'product_id_int'})
 
+                df_prods['product_tmpl_id_int'] = df_prods['product_tmpl_id'].apply(
+                    lambda x: x[0] if isinstance(x, (list, tuple)) else x
+                )
+
+                tmpl_ids_reales = df_prods['product_tmpl_id_int'].dropna().unique().tolist()
+
+
                 data_costs = client.search_read(
-                    'product.supplierinfo', [('product_tmpl_id', 'in', product_ids)],
+                    'product.supplierinfo', [('product_tmpl_id', 'in', tmpl_ids_reales)],
                     ['product_tmpl_id', 'price']
                 )
                 if data_costs:
                     df_costs = pd.DataFrame(data_costs)
-                    df_costs['product_id_int'] = df_costs['product_tmpl_id'].apply(
+                    df_costs['product_tmpl_id_int'] = df_costs['product_tmpl_id'].apply(
                         lambda x: x[0] if isinstance(x, (list, tuple)) else x)
-                    df_costs = df_costs.rename(columns={'price': 'costo_proveedor'}).drop_duplicates('product_id_int')
+                    df_costs = df_costs.rename(columns={'price': 'costo_proveedor'}).drop_duplicates('product_tmpl_id_int')
                 else:
-                    df_costs = pd.DataFrame(columns=['product_id_int', 'costo_proveedor'])
+                    df_costs = pd.DataFrame(columns=['product_tmpl_id_int', 'costo_proveedor'])
 
                 partner_ids_raw = list(set([
                     m['partner_id'][0] for m in df_moves.to_dict('records')
@@ -900,7 +1066,11 @@ def render_reporte(fecha_inicio, fecha_fin):
 
                 df_final = df_lineas.merge(df_moves, on='move_id_int', how='left')
                 df_final = df_final.merge(df_prods,  on='product_id_int', how='left')
-                df_final = df_final.merge(df_costs[['product_id_int', 'costo_proveedor']], on='product_id_int', how='left')
+                df_final = df_final.merge(
+                    df_costs[['product_tmpl_id_int', 'costo_proveedor']],
+                    on='product_tmpl_id_int',   # ← cruce correcto: template contra template
+                    how='left'
+                )
                 df_final['partner_id_int'] = df_final['partner_id'].apply(
                     lambda x: x[0] if isinstance(x, (list, tuple)) else None)
                 df_final = df_final.merge(df_partners, on='partner_id_int', how='left')
@@ -933,6 +1103,13 @@ def render_reporte(fecha_inicio, fecha_fin):
                         (df_final['invoice_date_obj'] >= df_final['oferta_inicio']) &
                         (df_final['invoice_date_obj'] <= df_final['oferta_fin'])
                     ]
+
+                    df_final = filtrar_por_aplica_cliente(df_final)
+
+                    if df_final.empty:
+                        st.warning("Sin líneas después de aplicar el filtro 'aplica_cliente'.")
+                        return
+
                     df_final['descuento_valor'] = df_final['descuento_so'].copy()
 
                     # Comparar vs CT Hoja1
@@ -956,7 +1133,7 @@ def render_reporte(fecha_inicio, fecha_fin):
                         df_final['gano_sellout'] = False
                     else:
                         df_final = aplicar_comparacion_ct_vs_sellout(
-                            df_final, df_so_ref, fecha_inicio, fecha_fin
+                            df_final, df_so_ref, fecha_inicio, fecha_fin, cadena_filtro   # ← nuevo argumento
                         )
 
                 if 'descuento_valor' not in df_final.columns:
@@ -1148,5 +1325,5 @@ def render_reporte(fecha_inicio, fecha_fin):
                             st.link_button(
                                 etiqueta,
                                 mailto,
-                                disabled=not tiene_correos or sin_excel   # ← MODIFICAR
+                                disabled=not tiene_correos or sin_excel  
                             )
