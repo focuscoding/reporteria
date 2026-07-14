@@ -74,6 +74,7 @@ PRESET_CONFIG_LAB = {
     'laboratorios farma, s.a.':     {'excluir': True,  'costo': False},
     'laboratorios siegfried s.a.':  {'excluir': True,  'costo': False},
     'especialidades dollder, c.a.': {'excluir': False, 'costo': True},
+    'laboratorios vargas, s.a': {'excluir': False, 'costo': True},
 }
 
 def _normalizar_nombre_lab(nombre):
@@ -462,12 +463,36 @@ def matchear_ct(df_final, url_ct):
     if not df_hoja1.empty:
         h1_cad = df_hoja1[df_hoja1['cadena_key'].isin(CADENAS_FARMAGO_FARMATENCION)]
         if not h1_cad.empty:
-            h1_cad_dedup = h1_cad.drop_duplicates(subset=['cadena_key', 'laboratorio_key'])
+            # NO deduplicar antes de filtrar vigencia: puede haber múltiples
+            # reglas para la misma cadena+laboratorio con rangos de fecha
+            # distintos (ej. 5% del 1-8 de julio y 10% del 9-10 de julio).
+            # Deduplicar aquí perdería una de las reglas antes de poder
+            # evaluar cuál aplica a cada factura según su fecha real.
             m = df.merge(
-                h1_cad_dedup[['cadena_key', 'laboratorio_key', 'descuento_ct', 'vigencia_inicio', 'vigencia_fin']],
+                h1_cad[['cadena_key', 'laboratorio_key', 'descuento_ct', 'vigencia_inicio', 'vigencia_fin']],
                 left_on=['cadena_key_f', 'lab_key'], right_on=['cadena_key', 'laboratorio_key'], how='inner'
             )
             m = _filtrar_vigencia(m, 'vigencia_inicio', 'vigencia_fin')
+
+            # Red de seguridad: si por error de carga en el Sheets dos rangos
+            # de vigencia se solapan genuinamente (misma factura matchea dos
+            # reglas vigentes a la vez), priorizar el mayor descuento para no
+            # duplicar la línea. Con rangos correctamente secuenciales (sin
+            # solaparse) esto nunca debería activarse.
+            if 'id' in m.columns and m.duplicated(subset=['id']).any():
+                n_antes_cad = len(m)
+                m = (
+                    m.sort_values('descuento_ct', ascending=False)
+                    .drop_duplicates(subset=['id'], keep='first')
+                )
+                n_dedup_cad = n_antes_cad - len(m)
+                if n_dedup_cad > 0:
+                    st.warning(
+                        f"⚠️ Hoja1 CT (Farmago/Farmatención): {n_dedup_cad} línea(s) con rangos "
+                        f"de vigencia solapados para la misma cadena+laboratorio — se tomó el "
+                        f"mayor descuento. Revisa el Sheets si esto no era esperado."
+                    )
+
             if not m.empty:
                 hoja1_matches.append(m)
 
@@ -876,8 +901,8 @@ def render_reporte(fecha_inicio, fecha_fin):
 
         st.divider()
 
-        # ── 3. GENERAR REPORTE ───────────────────────────────────────
-        if st.button("🚀 Generar Reporte", type="primary"):
+        # ── 3. Generar Consolidado ───────────────────────────────────────
+        if st.button("🚀 Generar Consolidado", type="primary"):
             try:
                 domain = [
                     ('date', '>=', str(fecha_inicio)), ('date', '<=', str(fecha_fin)),
@@ -974,7 +999,7 @@ def render_reporte(fecha_inicio, fecha_fin):
                     f"Error crítico: {e}\n\n"
                     "Si el error menciona '503' o 'Service Unavailable', es una caída temporal del "
                     "servidor de Odoo (no del reporte). Esperá unos segundos y volvé a presionar "
-                    "'🚀 Generar Reporte'."
+                    "'🚀 Generar Consolidado."
                 )
 
     # ── 4. RENDERIZADO DE RESULTADOS ─────────────────────────────────
