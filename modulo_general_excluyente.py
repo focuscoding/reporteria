@@ -350,10 +350,14 @@ def aplicar_descuentos_ct(df_final, url_ct, cadena_filtro=None):
         if not df_h1_filt.empty:
             # rama cadena (Farmago / Farmatención)
             if cadena_norm:
-                df_h1_merge = df_h1_filt.drop_duplicates(subset=['cadena_key', 'laboratorio_key'])
+                # NO deduplicar antes de filtrar vigencia: puede haber múltiples reglas
+                # para la misma cadena+laboratorio con rangos de fecha distintos
+                # (ej. 5% del 1-8 de julio y 10% del 9-10 de julio). Deduplicar aquí
+                # perdería una de las reglas antes de poder evaluar cuál aplica a
+                # cada factura según su fecha real.
                 df_hoja1_result = df_final.merge(
-                    df_h1_merge[['cadena_key', 'laboratorio_key', 'descuento_ct',
-                                'vigencia_inicio', 'vigencia_fin']],   # ← agregar fechas
+                    df_h1_filt[['cadena_key', 'laboratorio_key', 'descuento_ct',
+                                'vigencia_inicio', 'vigencia_fin']],
                     left_on=['cadena_key_f', 'lab_key'],
                     right_on=['cadena_key', 'laboratorio_key'],
                     how='inner'
@@ -362,7 +366,7 @@ def aplicar_descuentos_ct(df_final, url_ct, cadena_filtro=None):
             else:
                 df_hoja1_result = df_final.merge(
                     df_h1_filt[['partner_name_key', 'laboratorio_key', 'descuento_ct',
-                                'vigencia_inicio', 'vigencia_fin']],   # ← agregar fechas
+                                'vigencia_inicio', 'vigencia_fin']],
                     left_on=['partner_key', 'lab_key'],
                     right_on=['partner_name_key', 'laboratorio_key'],
                     how='inner'
@@ -385,7 +389,25 @@ def aplicar_descuentos_ct(df_final, url_ct, cadena_filtro=None):
                 df_hoja1_result = df_hoja1_result[dentro_rango].copy()
                 df_hoja1_result = df_hoja1_result.drop(columns=['invoice_date_obj'], errors='ignore')
 
-
+                # ── Red de seguridad: si por error de carga en el Sheets dos rangos
+                # de vigencia se solapan genuinamente (misma factura matchea dos
+                # reglas vigentes a la vez), priorizar el mayor descuento para no
+                # duplicar la línea. Con rangos correctamente secuenciales (sin
+                # solaparse) esto nunca debería activarse.
+                id_cols_h1 = [c for c in ['id', 'move_id_int', 'product_id_int'] if c in df_hoja1_result.columns]
+                if id_cols_h1 and df_hoja1_result.duplicated(subset=id_cols_h1).any():
+                    n_antes_h1 = len(df_hoja1_result)
+                    df_hoja1_result = (
+                        df_hoja1_result.sort_values('descuento_valor', ascending=False)
+                        .drop_duplicates(subset=id_cols_h1, keep='first')
+                    )
+                    n_dedup_h1 = n_antes_h1 - len(df_hoja1_result)
+                    if n_dedup_h1 > 0:
+                        st.warning(
+                            f"⚠️ Hoja1 CT: {n_dedup_h1} línea(s) con rangos de vigencia solapados "
+                            f"para la misma cadena/cliente+laboratorio — se tomó el mayor descuento. "
+                            f"Revisa el Sheets si esto no era esperado."
+                        )
 
             df_hoja1_result['_fuente'] = 'hoja1'
     else:
