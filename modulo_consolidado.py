@@ -25,6 +25,8 @@ from datetime import date
 from odoo_utils import OdooClient
 import numpy as np
 import unicodedata
+import requests
+import urllib.parse
 
 # ─────────────────────────────────────────────
 # CONSTANTES
@@ -41,7 +43,25 @@ URL_CT_DEFAULT = "https://docs.google.com/spreadsheets/d/1R6xw2K5sHyRIMDAlr3fn0x
 REINTENTOS_ODOO      = 3
 ESPERA_REINTENTO_SEG = 4  
 
+#Para separacion de reportes y emails
 
+TIPO_LABELS = {
+    'sellout':      'SELL-OUT',
+    'ct_lineal':    'Descuentos CT Lineal',
+    'farmago':      'Farmago',
+    'farmatencion': 'Farmatención',
+}
+
+def _slug_lab(lab):
+    """Nombre de laboratorio apto para nombre de archivo."""
+    return (
+        lab.replace(" ", "_").replace("/", "").replace("\\", "").replace(":", "")
+        .replace("á", "a").replace("é", "e").replace("í", "i")
+        .replace("ó", "o").replace("ú", "u").replace("Á", "A")
+        .replace("É", "E").replace("Í", "I").replace("Ó", "O")
+        .replace("Ú", "U").replace("ü", "u").replace("Ü", "U")
+        .replace("ñ", "n").replace("Ñ", "N")
+    )
 
 
 # ─────────────────────────────────────────────
@@ -494,6 +514,7 @@ def matchear_ct(df_final, url_ct):
                     )
 
             if not m.empty:
+                m['tipo_ct'] = m['cadena_key']  # 'farmago' o 'farmatencion'
                 hoja1_matches.append(m)
 
         h1_gen = df_hoja1[~df_hoja1['cadena_key'].isin(CADENAS_FARMAGO_FARMATENCION)]
@@ -504,6 +525,7 @@ def matchear_ct(df_final, url_ct):
             )
             m = _filtrar_vigencia(m, 'vigencia_inicio', 'vigencia_fin')
             if not m.empty:
+                m['tipo_ct'] = 'ct_lineal'
                 hoja1_matches.append(m)
 
     df_hoja1_result = pd.DataFrame()
@@ -533,6 +555,16 @@ def matchear_ct(df_final, url_ct):
         m_cad = m_cad.rename(columns={'descuento_det': 'descuento_ct'})
         m_cli = m_cli.rename(columns={'descuento_det': 'descuento_ct'})
 
+        # tipo_ct: si la cadena_cliente_det_key es farmago/farmatencion, esa es
+        # la clasificación; si es un nombre de cliente/cadena distinto, se
+        # considera parte del universo general (CT Lineal), igual que en los
+        # módulos originales.
+        for _m in (m_cad, m_cli):
+            if not _m.empty:
+                _m['tipo_ct'] = _m['cadena_cliente_det_key'].apply(
+                    lambda v: v if v in CADENAS_FARMAGO_FARMATENCION else 'ct_lineal'
+                )
+
         partes = [p for p in [m_cad, m_cli] if not p.empty]
         if partes:
             df_detalle_result = pd.concat(partes, ignore_index=True)
@@ -541,7 +573,7 @@ def matchear_ct(df_final, url_ct):
             df_detalle_result['_fuente'] = 'detalle'
 
     if df_hoja1_result.empty and df_detalle_result.empty:
-        return pd.DataFrame(columns=['id', 'descuento_ct', 'fuente_ct'])
+        return pd.DataFrame(columns=['id', 'descuento_ct', 'fuente_ct', 'tipo_ct'])
 
     # Unión final: Hoja1 primero, Detalle al final -> keep='last' hace que Detalle gane
     partes_finales = [p for p in [df_hoja1_result, df_detalle_result] if not p.empty]
@@ -571,7 +603,7 @@ def matchear_ct(df_final, url_ct):
         df_union = pd.concat([df_h1r, df_otros], ignore_index=True)
 
     df_union = df_union.rename(columns={'_fuente': 'fuente_ct'})
-    return df_union[['id', 'descuento_ct', 'fuente_ct']].drop_duplicates(subset=['id'])
+    return df_union[['id', 'descuento_ct', 'fuente_ct', 'tipo_ct']].drop_duplicates(subset=['id'])
 
 
 def matchear_sellout(df_final, df_so):
@@ -617,7 +649,26 @@ def matchear_sellout(df_final, df_so):
 
 def calcular_descuentos_finales(df_bruto, config_lab):
     """
-    ... (docstring igual) ...
+    
+    df_bruto: df_final + columnas 'descuento_ct' y 'descuento_so' (NaN si no matchea).
+    Ya viene filtrado a solo líneas que matchean al menos una fuente.
+
+    Devuelve un DataFrame (puede tener MÁS filas que df_bruto) con columnas:
+      - descuento_valor : descuento a aplicar en esa línea
+      - fuente_final    : 'ct' o 'so' (determina la fórmula de precio unitario)
+      - price_unit_base : precio base (siempre el precio de factura; ya no se
+                           recalcula/ajusta entre fuentes)
+      - gano_sellout    : True si la línea corresponde al lado SellOut de una
+                           venta que también matcheó CT (informativo)
+
+    Reglas por línea (según config_lab[lab]['excluir']):
+      - Solo matchea CT  → una línea, descuento CT.
+      - Solo matchea SO  → una línea, descuento SellOut.
+      - Matchea ambas y el laboratorio NO tiene "Excluir" marcado (modo Libre):
+        → SE GENERAN DOS LÍNEAS (ambas ventas), una con el descuento SellOut
+          y otra con el descuento CT, cada una con precio normal (sin ajustes).
+      - Matchea ambas y el laboratorio SÍ tiene "Excluir" marcado:
+        → una sola línea, con el mayor de los dos descuentos.
     """
     df = df_bruto.copy()
     df['lab_key'] = df['laboratory_name'].apply(
@@ -635,6 +686,7 @@ def calcular_descuentos_finales(df_bruto, config_lab):
     if not solo_ct.empty:
         solo_ct['descuento_valor'] = solo_ct['descuento_ct']
         solo_ct['fuente_final']    = 'ct'
+        solo_ct['tipo_reporte']    = solo_ct['tipo_ct']
         solo_ct['price_unit_base'] = solo_ct['price_unit']
         solo_ct['gano_sellout']    = False
         partes.append(solo_ct)
@@ -642,6 +694,7 @@ def calcular_descuentos_finales(df_bruto, config_lab):
     if not solo_so.empty:
         solo_so['descuento_valor'] = solo_so['descuento_so']
         solo_so['fuente_final']    = 'so'
+        solo_so['tipo_reporte']    = 'sellout'
         solo_so['price_unit_base'] = solo_so['price_unit']
         solo_so['gano_sellout']    = False
         partes.append(solo_so)
@@ -665,11 +718,12 @@ def calcular_descuentos_finales(df_bruto, config_lab):
             so_gana = ambos_excl['descuento_so'] >= ambos_excl['descuento_ct']
             ambos_excl['descuento_valor'] = np.where(so_gana, ambos_excl['descuento_so'], ambos_excl['descuento_ct'])
             ambos_excl['fuente_final']    = np.where(so_gana, 'so', 'ct')
-            # El precio base SIEMPRE viene invertido por SellOut, gane quien gane,
-            # para que el descuento ganador se aplique sobre el precio ya ajustado.
+            ambos_excl['tipo_reporte']    = np.where(so_gana, 'sellout', ambos_excl['tipo_ct'])
             ambos_excl['price_unit_base'] = ambos_excl['price_unit_base_so']
             ambos_excl['gano_sellout']    = so_gana
             partes.append(ambos_excl.drop(columns=['excluir_lab', 'price_unit_base_so']))
+
+        
 
         # ── Modo Libre: DOS líneas — ambas ventas se reportan ──
         ambos_libre = ambos[~ambos['excluir_lab']].copy()
@@ -677,15 +731,14 @@ def calcular_descuentos_finales(df_bruto, config_lab):
             linea_so = ambos_libre.drop(columns=['excluir_lab']).copy()
             linea_so['descuento_valor'] = linea_so['descuento_so']
             linea_so['fuente_final']    = 'so'
-            # La línea 'so' calcula su valor_unitario aparte (fórmula propia
-            # price_unit/(1-descuento_so) en calcular_valor_unitario), no usa price_unit_base.
+            linea_so['tipo_reporte']    = 'sellout'
             linea_so['price_unit_base'] = linea_so['price_unit']
             linea_so['gano_sellout']    = True
 
             linea_ct = ambos_libre.drop(columns=['excluir_lab']).copy()
             linea_ct['descuento_valor'] = linea_ct['descuento_ct']
             linea_ct['fuente_final']    = 'ct'
-            # NUEVO: la línea CT usa el precio ya invertido por SellOut como base.
+            linea_ct['tipo_reporte']    = linea_ct['tipo_ct']
             linea_ct['price_unit_base'] = linea_ct['price_unit_base_so']
             linea_ct['gano_sellout']    = False
 
@@ -693,11 +746,11 @@ def calcular_descuentos_finales(df_bruto, config_lab):
             partes.append(linea_ct.drop(columns=['price_unit_base_so']))
 
     if not partes:
-        cols = list(df.columns) + ['descuento_valor', 'fuente_final', 'price_unit_base', 'gano_sellout']
+        cols = list(df.columns) + ['descuento_valor', 'fuente_final', 'tipo_reporte', 'price_unit_base', 'gano_sellout']
         return pd.DataFrame(columns=cols)
 
     resultado = pd.concat(partes, ignore_index=True)
-    resultado = resultado.drop(columns=['descuento_ct', 'descuento_so'], errors='ignore')
+    resultado = resultado.drop(columns=['descuento_ct', 'descuento_so', 'tipo_ct'], errors='ignore')
     return resultado
 
 
@@ -827,6 +880,221 @@ def generar_excel_unico(df_res, config_lab):
 
     output.seek(0)
     return output.getvalue()
+
+
+# ─────────────────────────────────────────────
+# EXCEL INDIVIDUAL POR LAB
+# ─────────────────────────────────────────────
+def generar_excel_lab_tipo(df_lab_tipo, config_lab):
+    """
+    Genera un Excel de una sola hoja para un laboratorio y tipo de reporte
+    específico (SellOut / CT Lineal / Farmago / Farmatención), replicando
+    el formato de los módulos individuales (una fila por línea, formato
+    de moneda condicional por fila según currency_id).
+    """
+    if df_lab_tipo.empty:
+        return None
+
+    df = df_lab_tipo.copy()
+    for col in ['quantity', 'price_unit', 'costo_laboratorio', 'descuento_valor', 'price_unit_base']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    df['valor_calculado'] = df.apply(lambda r: calcular_valor_unitario(r, config_lab), axis=1)
+
+    reporte = pd.DataFrame({
+        'invoice_date':        df['invoice_date'],
+        'partner_id_num':      df['partner_id_num'],
+        'partner_id':          df['partner_id'],
+        'invoice_number_next': df['invoice_number_next'],
+        'barcode':             df['barcode'],
+        'name':                df['name'],
+        'laboratory_name':     df['laboratory_name'],
+        'supplier_code':       df['supplier_code'],
+        'quantity':            df['quantity'],
+        'valor_unitario':      df['valor_calculado'],
+        'descuento':           df['descuento_valor'],
+        'Moneda':              df['currency_id'],
+    })
+    reporte['subtotal_bruto']  = reporte['quantity'] * reporte['valor_unitario']
+    reporte['total_descuento'] = reporte['subtotal_bruto'] * reporte['descuento']
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        reporte_export = reporte.drop(columns=['Moneda'], errors='ignore')
+        reporte_export.to_excel(writer, index=False, sheet_name='Reporte', startrow=1, header=False)
+        workbook  = writer.book
+        worksheet = writer.sheets['Reporte']
+
+        header_format  = workbook.add_format({'bold': True, 'border': 0})
+        percent_format = workbook.add_format({'num_format': '0%'})
+        dollar_format  = workbook.add_format({'num_format': '$#,##0.00'})
+        bs_format      = workbook.add_format({'num_format': '"Bs." #,##0.00'})
+        bold_format    = workbook.add_format({'bold': True})
+
+        worksheet.set_column(10, 10, None, percent_format)
+        encabezados = [
+            'Fecha Factura', 'ID Cliente', 'Cliente', 'Nro. Factura',
+            'Código de Barras', 'Descripción', 'Laboratorio', 'Código Laboratorio',
+            'Cantidad', 'Precio', 'Descuento %', 'Total', 'Monto NC'
+        ]
+        for col_num, value in enumerate(encabezados):
+            worksheet.write(0, col_num, value, header_format)
+
+        for row_num in range(len(reporte)):
+            worksheet.write_formula(row_num + 1, 11, f'=J{row_num + 2}*I{row_num + 2}')
+            worksheet.write_formula(row_num + 1, 12, f'=K{row_num + 2}*L{row_num + 2}')
+
+        last_row = len(reporte) + 1
+        worksheet.write(last_row, 11, "Total NC", bold_format)
+        worksheet.write_formula(last_row, 12, f"=SUM(M2:M{last_row})", bold_format)
+
+        fmt = bs_format
+        for row_num, moneda in enumerate(reporte["Moneda"], start=1):
+            fmt = dollar_format if str(moneda).lower() in ["usd", "dolares", "$"] else bs_format
+            worksheet.conditional_format(row_num, 9,  row_num, 9,  {'type': 'no_errors', 'format': fmt})
+            worksheet.conditional_format(row_num, 11, row_num, 11, {'type': 'no_errors', 'format': fmt})
+            worksheet.conditional_format(row_num, 12, row_num, 12, {'type': 'no_errors', 'format': fmt})
+        worksheet.conditional_format(last_row, 12, last_row, 12, {'type': 'no_errors', 'format': fmt})
+
+        for i, col in enumerate(reporte.columns):
+            if i < 10:
+                col_data = reporte[col].astype(str).fillna("")
+                worksheet.set_column(i, i, max(col_data.map(len).max(), len(col)) + 2)
+        for col_idx in [11, 12]:
+            col_data = reporte['subtotal_bruto' if col_idx == 11 else 'total_descuento'].fillna(0).astype(float)
+            worksheet.set_column(col_idx, col_idx, max(col_data.astype(str).map(len).max(), 12) + 6)
+
+    output.seek(0)
+    return output.getvalue()
+
+
+# ─────────────────────────────────────────────
+# ENVIAR A SHEETS - LAB + TIPO
+# ─────────────────────────────────────────────
+
+def enviar_a_sheets_consolidado(df_res, fecha_inicio, fecha_fin, apps_script_url, config_lab):
+    """
+    Replica el envío de resumen a Google Sheets de los módulos originales,
+    iterando sobre cada combinación (laboratorio, tipo_reporte) presente en
+    el consolidado. Cada combinación se envía como un registro independiente,
+    con el mismo 'concepto' que generaría el módulo original correspondiente,
+    y respetando 'A Costo' según la configuración del laboratorio.
+    """
+    if df_res.empty:
+        return [], []
+
+    df = df_res.copy()
+    for col in ['quantity', 'price_unit', 'costo_laboratorio', 'descuento_valor', 'price_unit_base']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    df['valor_calculado'] = df.apply(lambda r: calcular_valor_unitario(r, config_lab), axis=1)
+    df['subtotal_bruto']  = df['quantity'] * df['valor_calculado']
+    df['total_descuento'] = df['subtotal_bruto'] * df['descuento_valor']
+
+    meses_es = {
+        'January':'Enero','February':'Febrero','March':'Marzo','April':'Abril',
+        'May':'Mayo','June':'Junio','July':'Julio','August':'Agosto',
+        'September':'Septiembre','October':'Octubre','November':'Noviembre','December':'Diciembre'
+    }
+    mes = f"{meses_es.get(fecha_inicio.strftime('%B'), fecha_inicio.strftime('%B'))} {fecha_inicio.strftime('%Y')}"
+
+    resultados, errores = [], []
+    for (lab, tipo), grupo in df.groupby(['laboratory_name', 'tipo_reporte']):
+        etiqueta_tipo = TIPO_LABELS.get(tipo, tipo)
+        if tipo == 'sellout':
+            concepto = f"Sell-Out del {fecha_inicio.strftime('%d/%m/%Y')} al {fecha_fin.strftime('%d/%m/%Y')} (en Panel)"
+        else:
+            concepto = f"{etiqueta_tipo} del {fecha_inicio.strftime('%d/%m/%Y')} al {fecha_fin.strftime('%d/%m/%Y')}"
+
+        moneda = str(grupo['currency_id'].iloc[0]).lower().strip()
+        total  = grupo['total_descuento'].sum()
+        es_usd = any(m in moneda for m in ['usd', 'dolar', '$'])
+
+        payload = {
+            "action": "append_data",
+            "data": {
+                "laboratorio": lab, "mes": mes, "concepto": concepto,
+                "monto_bs":  0 if es_usd else round(total, 2),
+                "monto_usd": round(total, 2) if es_usd else 0,
+            }
+        }
+        try:
+            result = requests.post(apps_script_url, json=payload, timeout=15).json()
+            if result.get("success"):
+                resultados.append(f"{lab} — {etiqueta_tipo}")
+            else:
+                errores.append(f"{lab} — {etiqueta_tipo}: {result.get('error', 'error desconocido')}")
+        except Exception as ex:
+            errores.append(f"{lab} — {etiqueta_tipo}: {str(ex)}")
+
+    return resultados, errores
+
+# ─────────────────────────────────────────────
+# ARMADO CORREOS
+# ─────────────────────────────────────────────
+def extraer_correos_html(html):
+    import re
+    if not html:
+        return []
+    return list(set(re.findall(r'[\w\.-]+@[\w\.-]+\.\w+', html)))
+
+ORDEN_TIPOS = ['sellout', 'ct_lineal', 'farmago', 'farmatencion']
+
+def _unir_tipos_es(items):
+    """['A'] -> 'A'; ['A','B'] -> 'A y B'; ['A','B','C'] -> 'A, B y C'."""
+    items = list(items)
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " y " + items[-1]
+
+def generar_mailto_consolidado(lab, tipos_presentes, fecha_inicio, fecha_fin, comment_por_lab, cc_emails):
+    """
+    Arma el mailto para un laboratorio del consolidado. A diferencia de los
+    módulos individuales (un solo tipo_activo por sesión), aquí un mismo
+    laboratorio puede tener líneas en varios tipos de reporte a la vez
+    (SellOut, CT Lineal, Farmago, Farmatención). El asunto se arma según
+    cuántos tipos aplican:
+      - 1 tipo  -> "Reporte SELL-OUT del ..."
+      - 2+ tipos -> "Reportes SELL-OUT, Farmago y Descuentos CT Lineal del ..."
+    Cuerpo y regla especial de Leti se mantienen igual que en los módulos originales.
+    """
+    correos_to = extraer_correos_html(comment_por_lab.get(lab, ''))
+
+    tipos_ordenados = [t for t in ORDEN_TIPOS if t in tipos_presentes]
+    etiquetas = [TIPO_LABELS.get(t, t) for t in tipos_ordenados]
+
+    if len(etiquetas) <= 1:
+        texto_reporte = f"Reporte {etiquetas[0]}" if etiquetas else "Reporte"
+    else:
+        texto_reporte = f"Reportes {_unir_tipos_es(etiquetas)}"
+
+    asunto = (
+        f"{lab} | {texto_reporte} del "
+        f"{fecha_inicio.strftime('%d/%m/%Y')} al {fecha_fin.strftime('%d/%m/%Y')}"
+    )
+
+    cuerpo = (
+        "Estimados señores, espero se encuentren bien.\n\n"
+        "Se envían los reportes con los descuentos aprobados durante el período indicado "
+        "para su reconocimiento a través de la nota de crédito correspondiente.\n\n"
+    )
+    if 'leti' in lab.lower():
+        cuerpo += (
+            "de no recibirse la nota en 5 días y habiendo cuentas por pagar vigentes, "
+            "se procederá a rebajarse el monto correspondiente en el pago.\n\n"
+        )
+    cuerpo += "Saludos,"
+
+    mailto = (
+        f"mailto:{urllib.parse.quote(','.join(correos_to))}"
+        f"?cc={urllib.parse.quote(','.join(cc_emails))}"
+        f"&subject={urllib.parse.quote(asunto)}"
+        f"&body={urllib.parse.quote(cuerpo)}"
+    )
+    return mailto, correos_to
 
 
 # ─────────────────────────────────────────────
@@ -979,9 +1247,9 @@ def render_reporte(fecha_inicio, fecha_fin):
                     # ── Matcheo contra SellOut y CT ──────────────────────
                     df_so = obtener_ofertas_sheets(url_so) if url_so else pd.DataFrame()
                     df_so_match = matchear_sellout(df_final, df_so)
-                    df_ct_match = matchear_ct(df_final, url_ct) if url_ct else pd.DataFrame(columns=['id', 'descuento_ct', 'fuente_ct'])
+                    df_ct_match = matchear_ct(df_final, url_ct) if url_ct else pd.DataFrame(columns=['id', 'descuento_ct', 'fuente_ct', 'tipo_ct'])
 
-                    df_bruto = df_final.merge(df_ct_match[['id', 'descuento_ct']], on='id', how='left')
+                    df_bruto = df_final.merge(df_ct_match[['id', 'descuento_ct', 'tipo_ct']], on='id', how='left')
                     df_bruto = df_bruto.merge(df_so_match[['id', 'descuento_so']], on='id', how='left')
                     df_bruto = df_bruto[df_bruto['descuento_ct'].notna() | df_bruto['descuento_so'].notna()].copy()
 
@@ -989,10 +1257,26 @@ def render_reporte(fecha_inicio, fecha_fin):
                         st.warning("No se encontraron líneas con descuento vigente (SellOut o CT) en el período seleccionado.")
                         return
 
+                    # Correos por laboratorio
+                    lab_names = list({
+                        (x[1] if isinstance(x, (list, tuple)) else x)
+                        for x in df_final['laboratory_name'].dropna() if x
+                    })
+                    df_lab_partners = pd.DataFrame(odoo_search_read(
+                        'res.partner', [('name', 'in', lab_names)], ['id', 'name', 'comment']
+                    ))
+                    comment_por_lab = {}
+                    for _, row in df_lab_partners.iterrows():
+                        c = row['comment']
+                        comment_por_lab[row['name']] = str(c).strip() if c and c is not False else ''
+                    st.session_state.comment_por_lab = comment_por_lab
+
                     st.session_state.df_bruto = df_bruto
                     st.success(f"✅ {len(df_bruto)} línea(s) con descuento vigente encontradas.")
                     _recalcular_resultado(limpiar, limpiar_barcode)
                     st.rerun()
+
+                    
 
             except Exception as e:
                 st.error(
@@ -1032,6 +1316,100 @@ def render_reporte(fecha_inicio, fecha_fin):
                 file_name=f"Reporte_Unificado_del_{fecha_inicio.strftime('%d-%m-%Y')}_al_{fecha_fin.strftime('%d-%m-%Y')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+        
+
+        # ── 3️⃣ Descargas por proveedor ──────────────────────────────
+        st.divider()
+        st.subheader("3️⃣ Descargas por proveedor")
+        st.caption(
+            "Para cada laboratorio, descarga por separado las líneas correspondientes "
+            "a SellOut, CT Lineal, Farmago o Farmatención, con el mismo formato de "
+            "los módulos individuales."
+        )
+        labs_en_resultado = sorted(df_display['laboratory_name'].unique())
+        for lab in labs_en_resultado:
+            lab_key_serie = df_display.loc[df_display['laboratory_name'] == lab, 'lab_key']
+            lab_key = lab_key_serie.iloc[0] if not lab_key_serie.empty else lab.lower()
+            with st.expander(f"📦 {lab}"):
+                cols = st.columns(4)
+                for idx, tipo in enumerate(['sellout', 'ct_lineal', 'farmago', 'farmatencion']):
+                    etiqueta = TIPO_LABELS[tipo]
+                    df_sub = df_display[
+                        (df_display['laboratory_name'] == lab) &
+                        (df_display['tipo_reporte'] == tipo)
+                    ]
+                    with cols[idx]:
+                        if df_sub.empty:
+                            st.caption(f"{etiqueta}\n\nsin líneas")
+                        else:
+                            excel_bytes = generar_excel_lab_tipo(df_sub, st.session_state.config_lab)
+                            safe_lab = _slug_lab(lab)
+                            st.download_button(
+                                label=f"{etiqueta} ({len(df_sub)})",
+                                data=excel_bytes,
+                                file_name=(
+                                    f"{safe_lab}_{etiqueta.replace(' ', '_')}_del_"
+                                    f"{fecha_inicio.strftime('%d-%m-%Y')}_al_"
+                                    f"{fecha_fin.strftime('%d-%m-%Y')}.xlsx"
+                                ),
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key=f"dl_{lab_key}_{tipo}"
+                            )
+
+        # ── 4️⃣ Enviar a Google Sheets ───────────────────────────────
+        st.divider()
+        st.subheader("4️⃣ Enviar resumen a Google Sheets")
+        apps_url = st.text_input(
+            "URL del Apps Script",
+            value=st.secrets.get("appscript", {}).get("url", ""),
+            key="input_apps_script_url_consolidado"
+        )
+        if st.button("📨 Enviar resumen NC a Sheets", type="primary"):
+            if not apps_url:
+                st.error("Ingresa la URL del Apps Script.")
+            else:
+                with st.spinner("Enviando datos..."):
+                    ok, errores = enviar_a_sheets_consolidado(
+                        df_display, fecha_inicio, fecha_fin, apps_url, st.session_state.config_lab
+                    )
+                if ok:
+                    st.success(f"✅ Enviados: {', '.join(ok)}")
+                for e in errores:
+                    st.error(f"❌ {e}")
+
+        # ── 5️⃣ Enviar correos a laboratorios ────────────────────────────
+        st.divider()
+        st.subheader("5️⃣ Enviar correos a laboratorios")
+        CC_DEFAULT = ["staddeo.blv@gmail.com", "staddeo@drogueriablv.com"]
+        cc_input = st.text_input(
+            "CC adicionales (separados por coma)",
+            value=", ".join(CC_DEFAULT), key="cc_emails_input_consolidado"
+        )
+        CC_EMAILS = [e.strip() for e in cc_input.split(",") if e.strip()]
+        comment_por_lab = st.session_state.get('comment_por_lab', {})
+
+        labs_en_resultado = sorted(df_display['laboratory_name'].unique())
+        for i in range(0, len(labs_en_resultado), 3):
+            cols = st.columns(3)
+            for j in range(3):
+                if i + j < len(labs_en_resultado):
+                    lab = labs_en_resultado[i + j]
+                    tipos_lab = set(
+                        df_display.loc[df_display['laboratory_name'] == lab, 'tipo_reporte'].unique()
+                    )
+                    mailto, correos_to = generar_mailto_consolidado(
+                        lab, tipos_lab, fecha_inicio, fecha_fin, comment_por_lab, CC_EMAILS
+                    )
+                    tiene_correos = len(correos_to) > 0
+                    etiqueta = f"✉️ {lab}" if tiene_correos else f"⚠️ {lab} (sin correos)"
+                    etiquetas_tipo = ", ".join(TIPO_LABELS.get(t, t) for t in ORDEN_TIPOS if t in tipos_lab)
+                    with cols[j]:
+                        st.link_button(etiqueta, mailto, disabled=not tiene_correos)
+                        st.caption(etiquetas_tipo)            
+
+
+
+
 
 
 def _recalcular_resultado(limpiar, limpiar_barcode):
@@ -1059,6 +1437,7 @@ def _recalcular_resultado(limpiar, limpiar_barcode):
         'descuento_valor':     df_final['descuento_valor'],
         'currency_id':         df_final['currency_id'].apply(limpiar),
         'fuente_final':        df_final['fuente_final'],
+        'tipo_reporte':        df_final['tipo_reporte'],
         'gano_sellout':        df_final['gano_sellout'],
         'price_unit_base':     df_final['price_unit_base'],
         'lab_key':             df_final['lab_key'],
