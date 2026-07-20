@@ -5,6 +5,7 @@ import modulo_general_excluyente
 import modulo_general_libre
 import modulo_extraccion_general
 import modulo_consolidado
+import ims
 
 
 
@@ -58,7 +59,7 @@ if parametros_actuales != st.session_state.parametros_previos:
     st.session_state.parametros_previos = parametros_actuales
 
 # --- NAVEGACIÓN ---
-opcion = st.sidebar.radio("Seleccione Reporte", ["Facturación Farmago", "Consolidado", "Reportes Sell-Out Excluyente", "Reportes Sell-Out Libre", "Extracción General"])
+opcion = st.sidebar.radio("Seleccione Reporte", ["Facturación Farmago", "Consolidado", "IMS", "Reportes Sell-Out Excluyente", "Reportes Sell-Out Libre", "Extracción General"])
 
 st.divider()
 
@@ -71,5 +72,7 @@ elif opcion == "Reportes Sell-Out Libre":
     modulo_general_libre.render_reporte(f_inicio, f_fin)
 elif opcion == "Consolidado":
     modulo_consolidado.render_reporte(f_inicio, f_fin)
+elif opcion == "IMS":
+    ims.render_reporte(f_inicio, f_fin)
 else:
     modulo_extraccion_general.render_extraccion_general(f_inicio, f_fin)
