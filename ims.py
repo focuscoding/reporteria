@@ -111,7 +111,7 @@ def construir_nombre_archivo(fecha_inicio, fecha_fin, fecha_extraccion=None):
 
     numero_mes = f"{fecha_extraccion.month:02d}"
     mes_3letras = MESES_ABREV_ES[fecha_extraccion.month]
-    dia_extraccion = f"{fecha_extraccion.year:02d}"
+    dia_extraccion = f"{fecha_extraccion.day:02d}"
     fi = fecha_inicio.strftime('%d-%m')
     ff = fecha_fin.strftime('%d-%m')
 
@@ -408,6 +408,7 @@ def _escribir_facmes(workbook, df_facmes, header_format_center, header_format_le
     worksheet = workbook.add_worksheet("FACMES")
     monto_format_center      = workbook.add_format({'num_format': num_format_total, 'align': 'center'})
     bold_monto_format_center = workbook.add_format({'num_format': num_format_total, 'bold': True, 'align': 'center'})
+    total_format_center      = workbook.add_format({'align': 'center'})  # formato General (sin num_format)
 
     encabezados = ['COD ART', 'COD CLIENTE', 'UNIDADES', 'TOTAL', 'FECHA VENTAS', '', '', '']
     for col_num, value in enumerate(encabezados):
@@ -420,7 +421,7 @@ def _escribir_facmes(workbook, df_facmes, header_format_center, header_format_le
         worksheet.write(row_num + 1, 0, fila['COD ART'], data_format_center)
         worksheet.write(row_num + 1, 1, fila['COD CLIENTE'], data_format_center)
         worksheet.write(row_num + 1, 2, fila['UNIDADES'], data_format_center)
-        worksheet.write(row_num + 1, 3, fila['TOTAL'], monto_format_center)
+        worksheet.write(row_num + 1, 3, fila['TOTAL'], total_format_center)
         worksheet.write(row_num + 1, 4, fila['FECHA VENTAS'])  # sin centrar (excepción pedida)
         # columnas F y G quedan vacías a propósito
 
