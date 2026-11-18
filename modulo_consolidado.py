@@ -998,15 +998,13 @@ def _es_moneda_usd(moneda):
 
 def _escribir_hoja_reporte(workbook, sheet_name, reporte, header_format, percent_format,
                             num_format_moneda, bold_format):
-    """Escribe una hoja de reporte homogénea en moneda, con el mismo layout/fórmulas
-    que los módulos originales."""
     worksheet = workbook.add_worksheet(sheet_name)
     monto_format      = workbook.add_format({'num_format': num_format_moneda})
     bold_monto_format = workbook.add_format({'num_format': num_format_moneda, 'bold': True})
 
-    worksheet.set_column(10, 10, None, percent_format)
+    worksheet.set_column(11, 11, None, percent_format)   # Descuento % (antes 10)
     encabezados = [
-        'Fecha Factura', 'ID Cliente', 'Cliente', 'Nro. Factura',
+        'Pedido Origen', 'Fecha Factura', 'ID Cliente', 'Cliente', 'Nro. Factura',
         'Código de Barras', 'Descripción', 'Laboratorio', 'Código Laboratorio',
         'Cantidad', 'Precio', 'Descuento %', 'Total', 'Monto NC'
     ]
@@ -1014,77 +1012,66 @@ def _escribir_hoja_reporte(workbook, sheet_name, reporte, header_format, percent
         worksheet.write(0, col_num, value, header_format)
 
     columnas_datos = [
-        'invoice_date', 'partner_id_num', 'partner_id', 'invoice_number_next',
+        'invoice_origin', 'invoice_date', 'partner_id_num', 'partner_id', 'invoice_number_next',
         'barcode', 'name', 'laboratory_name', 'supplier_code',
         'quantity', 'valor_unitario', 'descuento',
     ]
     for row_num, (_, fila) in enumerate(reporte.iterrows()):
         for col_num, campo in enumerate(columnas_datos):
             worksheet.write(row_num + 1, col_num, fila[campo])
-        worksheet.write(row_num + 1, 9, fila['valor_unitario'], monto_format)
-        worksheet.write_formula(row_num + 1, 11, f'=J{row_num + 2}*I{row_num + 2}', monto_format)
-        worksheet.write_formula(row_num + 1, 12, f'=K{row_num + 2}*L{row_num + 2}', monto_format)
+        worksheet.write(row_num + 1, 10, fila['valor_unitario'], monto_format)          # K Precio
+        worksheet.write_formula(row_num + 1, 12, f'=K{row_num + 2}*J{row_num + 2}', monto_format)  # M Total
+        worksheet.write_formula(row_num + 1, 13, f'=L{row_num + 2}*M{row_num + 2}', monto_format)  # N Monto NC
 
     last_row = len(reporte) + 1
-    worksheet.write(last_row, 11, "Total NC", bold_format)
-    worksheet.write_formula(last_row, 12, f"=SUM(M2:M{last_row})", bold_monto_format)
+    worksheet.write(last_row, 12, "Total NC", bold_format)
+    worksheet.write_formula(last_row, 13, f"=SUM(N2:N{last_row})", bold_monto_format)
 
     for i, col in enumerate(columnas_datos):
-        if i < 10:
+        if i < 11:   # hasta Precio (antes i < 10)
             col_data = reporte[col].astype(str).fillna("")
             worksheet.set_column(i, i, max(col_data.map(len).max(), len(encabezados[i])) + 2)
-    subtotal = reporte['quantity'] * reporte['valor_unitario']
+    subtotal   = reporte['quantity'] * reporte['valor_unitario']
     total_desc = subtotal * reporte['descuento']
-    worksheet.set_column(11, 11, max(subtotal.astype(str).map(len).max(), 12) + 6)
-    worksheet.set_column(12, 12, max(total_desc.astype(str).map(len).max(), 12) + 6)
+    worksheet.set_column(12, 12, max(subtotal.astype(str).map(len).max(), 12) + 6)
+    worksheet.set_column(13, 13, max(total_desc.astype(str).map(len).max(), 12) + 6)
 
     return worksheet
 
 def _escribir_hoja_reporte_con_tipo(workbook, sheet_name, reporte, header_format, percent_format,
                                      num_format_moneda, bold_format):
-    """
-    Igual que _escribir_hoja_reporte, pero agrega una columna adicional
-    'Tipo de Descuento' al final del bloque de datos (antes de Total/Monto NC),
-    para la vista combinada por laboratorio.
-    """
     worksheet = workbook.add_worksheet(sheet_name)
     monto_format      = workbook.add_format({'num_format': num_format_moneda})
     bold_monto_format = workbook.add_format({'num_format': num_format_moneda, 'bold': True})
 
     encabezados = [
-        'Fecha Factura', 'ID Cliente', 'Cliente', 'Nro. Factura',
+        'Pedido Origen', 'Fecha Factura', 'ID Cliente', 'Cliente', 'Nro. Factura',
         'Código de Barras', 'Descripción', 'Laboratorio', 'Código Laboratorio',
         'Cantidad', 'Precio', 'Descuento %', 'Tipo de Descuento', 'Total', 'Monto NC'
     ]
     for col_num, value in enumerate(encabezados):
         worksheet.write(0, col_num, value, header_format)
 
-    # Columnas escritas "en bloque" (sin formato especial por celda)
     columnas_datos_simples = [
-        'invoice_date', 'partner_id_num', 'partner_id', 'invoice_number_next',
+        'invoice_origin', 'invoice_date', 'partner_id_num', 'partner_id', 'invoice_number_next',
         'barcode', 'name', 'laboratory_name', 'supplier_code',
         'quantity',
     ]
     for row_num, (_, fila) in enumerate(reporte.iterrows()):
         for col_num, campo in enumerate(columnas_datos_simples):
             worksheet.write(row_num + 1, col_num, fila[campo])
-        # Precio (J) con formato de moneda
-        worksheet.write(row_num + 1, 9, fila['valor_unitario'], monto_format)
-        # Descuento % (K) con formato de porcentaje explícito
-        worksheet.write(row_num + 1, 10, fila['descuento'], percent_format)
-        # Tipo de Descuento (L), texto plano
-        worksheet.write(row_num + 1, 11, fila['tipo_descuento'])
-        # Total (M) = Precio × Cantidad
-        worksheet.write_formula(row_num + 1, 12, f'=J{row_num + 2}*I{row_num + 2}', monto_format)
-        # Monto NC (N) = Descuento% × Total
-        worksheet.write_formula(row_num + 1, 13, f'=K{row_num + 2}*M{row_num + 2}', monto_format)
+        worksheet.write(row_num + 1, 10, fila['valor_unitario'], monto_format)     # K Precio
+        worksheet.write(row_num + 1, 11, fila['descuento'], percent_format)        # L Descuento %
+        worksheet.write(row_num + 1, 12, fila['tipo_descuento'])                   # M Tipo
+        worksheet.write_formula(row_num + 1, 13, f'=K{row_num + 2}*J{row_num + 2}', monto_format)  # N Total
+        worksheet.write_formula(row_num + 1, 14, f'=L{row_num + 2}*N{row_num + 2}', monto_format)  # O Monto NC
 
     last_row = len(reporte) + 1
-    worksheet.write(last_row, 12, "Total NC", bold_format)
-    worksheet.write_formula(last_row, 13, f"=SUM(N2:N{last_row})", bold_monto_format)
+    worksheet.write(last_row, 13, "Total NC", bold_format)
+    worksheet.write_formula(last_row, 14, f"=SUM(O2:O{last_row})", bold_monto_format)
 
     columnas_ancho = [
-        'invoice_date', 'partner_id_num', 'partner_id', 'invoice_number_next',
+        'invoice_origin', 'invoice_date', 'partner_id_num', 'partner_id', 'invoice_number_next',
         'barcode', 'name', 'laboratory_name', 'supplier_code',
         'quantity', 'valor_unitario', 'descuento', 'tipo_descuento',
     ]
@@ -1093,8 +1080,8 @@ def _escribir_hoja_reporte_con_tipo(workbook, sheet_name, reporte, header_format
         worksheet.set_column(i, i, max(col_data.map(len).max(), len(encabezados[i])) + 2)
     subtotal   = reporte['quantity'] * reporte['valor_unitario']
     total_desc = subtotal * reporte['descuento']
-    worksheet.set_column(12, 12, max(subtotal.astype(str).map(len).max(), 12) + 6)
-    worksheet.set_column(13, 13, max(total_desc.astype(str).map(len).max(), 12) + 6)
+    worksheet.set_column(13, 13, max(subtotal.astype(str).map(len).max(), 12) + 6)
+    worksheet.set_column(14, 14, max(total_desc.astype(str).map(len).max(), 12) + 6)
 
     return worksheet
 
@@ -1120,6 +1107,7 @@ def generar_excel_unico(df_res, config_lab):
     df['es_usd'] = df['currency_id'].apply(_es_moneda_usd)
 
     reporte = pd.DataFrame({
+        'invoice_origin':      df['invoice_origin'],
         'invoice_date':        df['invoice_date'],
         'partner_id_num':      df['partner_id_num'],
         'partner_id':          df['partner_id'],
@@ -1182,6 +1170,7 @@ def generar_excel_lab_tipo(df_lab_tipo, config_lab):
     df['valor_calculado'] = df.apply(lambda r: calcular_valor_unitario(r, config_lab), axis=1)
 
     reporte = pd.DataFrame({
+        'invoice_origin':      df['invoice_origin'],
         'invoice_date':        df['invoice_date'],
         'partner_id_num':      df['partner_id_num'],
         'partner_id':          df['partner_id'],
@@ -1211,9 +1200,9 @@ def generar_excel_lab_tipo(df_lab_tipo, config_lab):
         bs_format      = workbook.add_format({'num_format': '"Bs." #,##0.00'})
         bold_format    = workbook.add_format({'bold': True})
 
-        worksheet.set_column(10, 10, None, percent_format)
+        worksheet.set_column(11, 11, None, percent_format)   # Descuento % (antes 10)
         encabezados = [
-            'Fecha Factura', 'ID Cliente', 'Cliente', 'Nro. Factura',
+            'Pedido Origen', 'Fecha Factura', 'ID Cliente', 'Cliente', 'Nro. Factura',
             'Código de Barras', 'Descripción', 'Laboratorio', 'Código Laboratorio',
             'Cantidad', 'Precio', 'Descuento %', 'Total', 'Monto NC'
         ]
@@ -1221,27 +1210,27 @@ def generar_excel_lab_tipo(df_lab_tipo, config_lab):
             worksheet.write(0, col_num, value, header_format)
 
         for row_num in range(len(reporte)):
-            worksheet.write_formula(row_num + 1, 11, f'=J{row_num + 2}*I{row_num + 2}')
-            worksheet.write_formula(row_num + 1, 12, f'=K{row_num + 2}*L{row_num + 2}')
+            worksheet.write_formula(row_num + 1, 12, f'=K{row_num + 2}*J{row_num + 2}')   # M Total
+            worksheet.write_formula(row_num + 1, 13, f'=L{row_num + 2}*M{row_num + 2}')   # N Monto NC
 
         last_row = len(reporte) + 1
-        worksheet.write(last_row, 11, "Total NC", bold_format)
-        worksheet.write_formula(last_row, 12, f"=SUM(M2:M{last_row})", bold_format)
+        worksheet.write(last_row, 12, "Total NC", bold_format)
+        worksheet.write_formula(last_row, 13, f"=SUM(N2:N{last_row})", bold_format)
 
         fmt = bs_format
         for row_num, moneda in enumerate(reporte["Moneda"], start=1):
             fmt = dollar_format if str(moneda).lower() in ["usd", "dolares", "$"] else bs_format
-            worksheet.conditional_format(row_num, 9,  row_num, 9,  {'type': 'no_errors', 'format': fmt})
-            worksheet.conditional_format(row_num, 11, row_num, 11, {'type': 'no_errors', 'format': fmt})
-            worksheet.conditional_format(row_num, 12, row_num, 12, {'type': 'no_errors', 'format': fmt})
-        worksheet.conditional_format(last_row, 12, last_row, 12, {'type': 'no_errors', 'format': fmt})
+            worksheet.conditional_format(row_num, 10, row_num, 10, {'type': 'no_errors', 'format': fmt})  # Precio
+            worksheet.conditional_format(row_num, 12, row_num, 12, {'type': 'no_errors', 'format': fmt})  # Total
+            worksheet.conditional_format(row_num, 13, row_num, 13, {'type': 'no_errors', 'format': fmt})  # Monto NC
+        worksheet.conditional_format(last_row, 13, last_row, 13, {'type': 'no_errors', 'format': fmt})
 
         for i, col in enumerate(reporte.columns):
-            if i < 10:
+            if i < 11:   # antes i < 10
                 col_data = reporte[col].astype(str).fillna("")
                 worksheet.set_column(i, i, max(col_data.map(len).max(), len(col)) + 2)
-        for col_idx in [11, 12]:
-            col_data = reporte['subtotal_bruto' if col_idx == 11 else 'total_descuento'].fillna(0).astype(float)
+        for col_idx in [12, 13]:
+            col_data = reporte['subtotal_bruto' if col_idx == 12 else 'total_descuento'].fillna(0).astype(float)
             worksheet.set_column(col_idx, col_idx, max(col_data.astype(str).map(len).max(), 12) + 6)
 
     output.seek(0)
@@ -1272,6 +1261,7 @@ def generar_excel_lab_combinado(df_lab_todo, config_lab):
     df['tipo_descuento']   = df['tipo_reporte'].apply(lambda t: TIPO_LABELS.get(t, t))
 
     reporte = pd.DataFrame({
+        'invoice_origin':      df['invoice_origin'],
         'invoice_date':        df['invoice_date'],
         'partner_id_num':      df['partner_id_num'],
         'partner_id':          df['partner_id'],
@@ -1538,7 +1528,7 @@ def render_reporte(fecha_inicio, fecha_fin):
 
                     df_moves = pd.DataFrame(odoo_search_read(
                         'account.move', [('id', 'in', move_ids)],
-                        ['invoice_date', 'partner_id', 'invoice_number_next', 'currency_id']
+                        ['invoice_date', 'partner_id', 'invoice_number_next', 'currency_id','invoice_origin']
                     )).rename(columns={'id': 'move_id_int'})
 
                     # Primero traer productos (variantes) con su template asociado
@@ -1823,8 +1813,12 @@ def _recalcular_resultado(limpiar, limpiar_barcode):
         return
 
     df_final = calcular_descuentos_finales(df_bruto, st.session_state.config_lab)
+    if 'invoice_origin' not in df_final.columns:   # por si hay un df_bruto viejo en sesión
+        df_final['invoice_origin'] = ''
 
     res = pd.DataFrame({
+        'invoice_origin':      df_final['invoice_origin'].apply(
+                               lambda x: '' if x is False or x is None or pd.isna(x) else str(x)),
         'invoice_date':        pd.to_datetime(df_final['invoice_date']).dt.strftime('%d/%m/%Y'),
         'partner_id_num':      df_final['partner_id'].apply(lambda x: x[0] if isinstance(x, (list, tuple)) else x),
         'partner_id':          df_final['partner_id'].apply(limpiar),
